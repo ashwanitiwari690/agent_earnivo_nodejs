@@ -1,0 +1,1390 @@
+// Earnivo Phase 2 — core schema.
+// UUID primary keys, snake_case columns/tables (via @map/@@map), soft
+// status transitions instead of hard deletes on business-critical rows.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+model Role {
+  id   String @id @default(uuid()) @db.Uuid
+  code String @unique // USER / AGENT / ADMIN
+  name String
+
+  users User[]
+
+  @@map("roles")
+}
+
+// email + passwordHash are required for the web Agent/Admin flow (Phase 2)
+// but absent for mobile USER accounts, which authenticate by phone + OTP
+// only (Phase 3) - hence both are optional here, with phone carrying the
+// uniqueness/verification guarantees for that flow instead.
+model User {
+  id                         String     @id @default(uuid()) @db.Uuid
+  email                      String?    @unique
+  phone                      String?    @unique
+  // Never collected at OTP signup (phone-only) - set later by the user
+  // themselves via PATCH /api/users/me, e.g. from the mobile app's profile
+  // screen. Null until then.
+  name                       String?
+  // Generated lazily on first GET /users/me/referral, not at registration -
+  // most users never open the referral tab, so there's no reason to spend a
+  // uniqueness-retry write on every signup (spec Phase 9 §1/§10).
+  referralCode               String?    @unique @map("referral_code")
+  // Aggregate only - a landing-page validation hit increments this, rather
+  // than inserting one row per anonymous visitor (spec §12/§17/§18: "do not
+  // introduce invasive tracking unnecessarily", "lightweight", "avoid
+  // unnecessary duplicate counters").
+  referralClickCount         Int        @default(0) @map("referral_click_count")
+  phoneVerified              Boolean    @default(false) @map("phone_verified")
+  passwordHash               String?    @map("password_hash")
+  // `googleId` is a leftover from Google Sign-In, which has been removed -
+  // users authenticate by phone + OTP, agents by email + password. The
+  // column is kept rather than dropped because dropping it would destroy the
+  // identifiers of any account that did register that way; nothing reads it
+  // now, and nothing writes it. Connecting a Google account for YouTube
+  // verification does NOT touch it - that identity lives in
+  // google_account_connections.googleAccountId instead.
+  //
+  // `emailVerified` is still live: it gates agent email/password sign-in
+  // (see the emailVerificationToken fields below).
+  googleId                   String?    @unique @map("google_id")
+  emailVerified              Boolean    @default(false) @map("email_verified")
+  roleId                     String     @map("role_id") @db.Uuid
+  status                     UserStatus @default(ACTIVE)
+  passwordResetTokenHash     String?    @map("password_reset_token_hash")
+  passwordResetExpiresAt     DateTime?  @map("password_reset_expires_at") @db.Timestamptz(6)
+  // Agent self-registration (email+password) gate: set at registration, sent
+  // as a link in the verification email, cleared once emailVerified flips to
+  // true. Never used for the OTP-based USER role (phone verification already
+  // covers that) or for a Google-linked account (emailVerified there comes
+  // from Google's own claim at sign-in, never from this token flow).
+  emailVerificationTokenHash String?    @map("email_verification_token_hash")
+  emailVerificationExpiresAt DateTime?  @map("email_verification_expires_at") @db.Timestamptz(6)
+  lastLoginAt                DateTime?  @map("last_login_at") @db.Timestamptz(6)
+  // Saved payout default (Ionic "Payment Methods" page) - pre-fills the
+  // Withdraw form only. Each Withdrawal row still snapshots its own
+  // method/upiId/mobileNumber at submission time, so editing this default
+  // later never changes the destination of an already-submitted request.
+  defaultPayoutMethod        String?    @map("default_payout_method")
+  defaultUpiId               String?    @map("default_upi_id")
+  defaultMobileNumber        String?    @map("default_mobile_number")
+  // Per-category in-app notification preferences (Ionic "Notification
+  // Settings" page) - checked centrally in notifications.service.ts's
+  // createNotification(), not re-implemented at each call site. Security/
+  // account-status notifications (suspension, reactivation, admin
+  // announcements) always bypass this and are never suppressible.
+  notifyRewards              Boolean    @default(true) @map("notify_rewards")
+  notifyCampaigns            Boolean    @default(true) @map("notify_campaigns")
+  notifyAccount              Boolean    @default(true) @map("notify_account")
+  createdAt                  DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                  DateTime   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  role                   Role                     @relation(fields: [roleId], references: [id])
+  agentProfile           AgentProfile?
+  refreshTokens          RefreshToken[]
+  auditLogs              AuditLog[]
+  activatedSubscriptions AgentSubscription[]      @relation("SubscriptionActivatedBy")
+  wallet                 UserWallet?
+  walletTransactions     WalletTransaction[]
+  taskCompletions        UserTaskCompletion[]
+  reviewedTaskProofs     UserTaskCompletion[]     @relation("TaskCompletionReviewedBy")
+  verifiedPayments       Payment[]                @relation("PaymentVerifiedBy")
+  withdrawals            Withdrawal[]
+  processedWithdrawals   Withdrawal[]             @relation("WithdrawalProcessedBy")
+  notifications          Notification[]
+  deviceTokens           DeviceToken[]
+  referralsMade          Referral[]               @relation("ReferralsMade")
+  referralReceived       Referral?                @relation("ReferralReceived")
+  supportTicketsRaised   SupportTicket[]          @relation("SupportTicketsRaised")
+  supportTicketsAssigned SupportTicket[]          @relation("SupportTicketsAssigned")
+  adEvents               AdEvent[]
+  gameCoinConversions    GameCoinConversion[]
+  googleConnection       GoogleAccountConnection? @relation("UserGoogleConnection")
+
+  @@index([roleId])
+  @@map("users")
+}
+
+// Doubles as the mobile "user_sessions" table: deviceId/platform/appVersion
+// are populated by the Ionic client, left null for web Agent/Admin logins.
+// One session-tracking mechanism for both auth flows rather than two.
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  deviceId   String?   @map("device_id")
+  platform   String?
+  appVersion String?   @map("app_version")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Agent
+// ---------------------------------------------------------------------------
+
+enum AgentStatus {
+  PENDING
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum VerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model AgentProfile {
+  id                 String             @id @default(uuid()) @db.Uuid
+  userId             String             @unique @map("user_id") @db.Uuid
+  name               String
+  email              String
+  phone              String?
+  businessName       String?            @map("business_name")
+  // Extended business/billing details (Agent Settings > Business Profile,
+  // Payments & Billing > Billing) - all optional, filled in by the agent
+  // themselves; nothing here is required to create or run a campaign.
+  businessType       String?            @map("business_type")
+  website            String?
+  address            String?
+  city               String?
+  state              String?
+  country            String?
+  taxId              String?            @map("tax_id")
+  // 'email' | 'download' - whether the agent wants invoices emailed to them
+  // or only available to view/download from the dashboard. Free-form string
+  // rather than a DB enum since it's a low-stakes display preference, not a
+  // value anything else branches on.
+  invoicePreference  String             @default("email") @map("invoice_preference")
+  profileImage       String?            @map("profile_image")
+  status             AgentStatus        @default(PENDING)
+  verificationStatus VerificationStatus @default(UNVERIFIED) @map("verification_status")
+  createdAt          DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user              User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptions     AgentSubscription[]
+  usage             SubscriptionUsage?
+  campaigns         Campaign[]
+  payments          Payment[]
+  googleConnection  GoogleAccountConnection? @relation("AgentGoogleConnection")
+  youtubeConnection YouTubeConnection?
+
+  @@index([status])
+  @@map("agent_profiles")
+}
+
+// ---------------------------------------------------------------------------
+// Subscription
+// ---------------------------------------------------------------------------
+
+enum BillingCycle {
+  FREE
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+model SubscriptionPlan {
+  id                    String       @id @default(uuid()) @db.Uuid
+  code                  String       @unique // FREE / STARTER / PROFESSIONAL
+  name                  String
+  // For a FREE plan this is the flat one-time price (0). For any other plan
+  // this is the WEEKLY base price - Monthly (x4) and Yearly (x52) are never
+  // stored, only ever computed from this one number (see plan-pricing.ts),
+  // so Admin only ever has one figure per tier to keep accurate.
+  price                 Int          @default(0) // whole rupees
+  currency              String       @default("INR")
+  billingCycle          BillingCycle @map("billing_cycle")
+  // Admin-set percentage discount (0-100) applied on top of the computed
+  // Weekly/Monthly/Yearly price - see plan-pricing.ts. Meaningless (left 0)
+  // for the Free Trial plan.
+  offerPercent          Int          @default(0) @map("offer_percent")
+  campaignLimit         Int          @map("campaign_limit")
+  campaignDurationHours Int          @map("campaign_duration_hours")
+  isFreeTrial           Boolean      @default(false) @map("is_free_trial")
+  isActive              Boolean      @default(true) @map("is_active")
+  features              Json         @default("[]")
+  createdAt             DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  agentSubscriptions AgentSubscription[]
+  payments           Payment[]
+
+  @@map("subscription_plans")
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  PENDING
+}
+
+model AgentSubscription {
+  id           String             @id @default(uuid()) @db.Uuid
+  agentId      String             @map("agent_id") @db.Uuid
+  planId       String             @map("plan_id") @db.Uuid
+  status       SubscriptionStatus @default(PENDING)
+  isTrial      Boolean            @default(false) @map("is_trial")
+  trialUsed    Boolean            @default(false) @map("trial_used")
+  // The cycle this specific subscription period was activated at (FREE for
+  // a trial row, WEEKLY/MONTHLY/YEARLY for a paid one) - drives expiresAt at
+  // activation time (admin-subscriptions.service.ts's activateForAgent).
+  // Nullable only so adding this column doesn't require backfilling rows
+  // created before this feature existed; every row created going forward
+  // always has one.
+  billingCycle BillingCycle?      @map("billing_cycle")
+  // A snapshot of what was actually charged for this period (nullable for
+  // the same pre-existing-row reason as billingCycle above) - since price
+  // is now cycle- and offer-dependent and can change over time, this is
+  // what subscription-history.component.ts displays instead of live
+  // plan.price, which a later Admin price/offer change would otherwise
+  // silently rewrite for every past purchase.
+  amountPaid   Decimal?           @map("amount_paid") @db.Decimal(12, 2)
+  startedAt    DateTime?          @map("started_at") @db.Timestamptz(6)
+  expiresAt    DateTime?          @map("expires_at") @db.Timestamptz(6)
+  activatedBy  String?            @map("activated_by") @db.Uuid
+  createdAt    DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  agent           AgentProfile        @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  plan            SubscriptionPlan    @relation(fields: [planId], references: [id])
+  activatedByUser User?               @relation("SubscriptionActivatedBy", fields: [activatedBy], references: [id])
+  campaigns       Campaign[]
+  usages          SubscriptionUsage[]
+
+  @@index([agentId])
+  @@index([planId])
+  @@index([status])
+  // Supports the expireSubscriptions cron's `status=ACTIVE AND expiresAt<=now`
+  // sweep query (spec Phase 8 §9/§18).
+  @@index([expiresAt])
+  @@map("agent_subscriptions")
+}
+
+model SubscriptionUsage {
+  id                    String    @id @default(uuid()) @db.Uuid
+  agentId               String    @unique @map("agent_id") @db.Uuid
+  subscriptionId        String?   @map("subscription_id") @db.Uuid
+  campaignsCreated      Int       @default(0) @map("campaigns_created")
+  campaignsActive       Int       @default(0) @map("campaigns_active")
+  campaignsExpired      Int       @default(0) @map("campaigns_expired")
+  trialUsed             Boolean   @default(false) @map("trial_used")
+  lastCampaignCreatedAt DateTime? @map("last_campaign_created_at") @db.Timestamptz(6)
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  agent        AgentProfile       @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  subscription AgentSubscription? @relation(fields: [subscriptionId], references: [id])
+
+  @@map("subscription_usage")
+}
+
+// ---------------------------------------------------------------------------
+// Campaign
+// ---------------------------------------------------------------------------
+
+model CampaignType {
+  id           String   @id @default(uuid()) @db.Uuid
+  code         String   @unique
+  name         String
+  isActive     Boolean  @default(true) @map("is_active")
+  // The admin-controlled default User reward for any task created under a
+  // campaign of this type (Phase 5 update). One row per type already gives
+  // us "one active reward config per type" for free via the existing
+  // `code` unique constraint - no separate CampaignTypeRewardConfig table
+  // needed. Changing this only affects tasks created from now on; every
+  // already-created Task keeps the value it was stamped with at creation
+  // (spec §10/§16) - see campaign-tasks.service.ts.
+  rewardAmount Decimal  @default(0) @map("reward_amount") @db.Decimal(12, 2)
+  currency     String   @default("INR")
+  displayOrder Int      @default(0) @map("display_order")
+  updatedBy    String?  @map("updated_by") @db.Uuid
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  campaigns Campaign[]
+
+  @@map("campaign_types")
+}
+
+enum CampaignCompletionFrequency {
+  ONCE
+  // Unlimited, immediate repeats - a user can redo the task again the moment
+  // their previous attempt finishes, with no daily cooldown at all (see
+  // eligibility.service.ts's resolveStartCycle, which is the only place that
+  // actually implements this - not a simple cycleDate like DAILY).
+  EVERY_TIME
+  DAILY
+}
+
+enum CampaignStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  ACTIVE
+  PAUSED
+  COMPLETED
+  EXPIRED
+  CANCELLED
+  // Terminal, admin-only: operationally retired but its history (tasks,
+  // completions, transactions) stays queryable exactly as before - archiving
+  // never deletes or recalculates anything (spec Phase 5 §2/§7).
+  ARCHIVED
+}
+
+model Campaign {
+  id                         String                      @id @default(uuid()) @db.Uuid
+  agentId                    String                      @map("agent_id") @db.Uuid
+  subscriptionId             String?                     @map("subscription_id") @db.Uuid
+  campaignTypeId             String                      @map("campaign_type_id") @db.Uuid
+  campaignName               String                      @map("campaign_name")
+  description                String?
+  objective                  String?
+  platform                   String?
+  creativeType               String?                     @map("creative_type")
+  imageUrl                   String?                     @map("image_url")
+  videoUrl                   String?                     @map("video_url")
+  destinationUrl             String?                     @map("destination_url")
+  cta                        String?
+  status                     CampaignStatus              @default(DRAFT)
+  rejectionReason            String?                     @map("rejection_reason")
+  submittedAt                DateTime?                   @map("submitted_at") @db.Timestamptz(6)
+  approvedAt                 DateTime?                   @map("approved_at") @db.Timestamptz(6)
+  startsAt                   DateTime?                   @map("starts_at") @db.Timestamptz(6)
+  expiresAt                  DateTime?                   @map("expires_at") @db.Timestamptz(6)
+  // Phase 4: overall capacity across all users completing this campaign's
+  // tasks. Null = unlimited. completedCount increments when a user finishes
+  // every required task; once it reaches completionLimit the campaign is
+  // flipped to COMPLETED and drops out of the feed (spec §18).
+  completionLimit            Int?                        @map("completion_limit")
+  completedCount             Int                         @default(0) @map("completed_count")
+  // Phase 13: opt-in ad-slot delivery. Null = an ordinary task campaign,
+  // never delivered through GET /ads/placements/:placement - only a
+  // campaign an agent has explicitly assigned to a placement is eligible,
+  // so this never changes behavior for the thousands of pre-existing
+  // campaigns that predate the ad engine.
+  // Agent-chosen reward repeatability (Display Visibility): ONCE (default)
+  // keeps today's one-time-ever reward; DAILY lets the same user redo the
+  // task and earn the reward again once per calendar day - see
+  // UserTaskCompletion.cycleDate, which is what actually enforces this.
+  completionFrequency        CampaignCompletionFrequency @default(ONCE) @map("completion_frequency")
+  // App Promotion only: the credential handed to whoever builds the promoted
+  // app, so its own "confirm install" callback (POST /app-verification/confirm)
+  // can be traced back to this exact campaign - see app-verification.service.ts.
+  // Auto-generated at creation for APP_PROMOTION campaigns, null for every
+  // other type.
+  appVerificationApiKey      String?                     @unique @map("app_verification_api_key")
+  // Website Promotion only: the agent's opt-in to real on-site verification
+  // instead of the in-app dwell timer. When enabled, the Ionic app never
+  // credits the reward itself - it appends a one-time token to
+  // destinationUrl, and the agent's own website calls back POST
+  // /website-verification/confirm with that token once the visitor has
+  // actually stayed on the page (see website-verification.service.ts).
+  // websiteVerificationApiKey is the site-side credential that pairs with
+  // the token, generated the moment the toggle is switched on and null for
+  // every campaign that never opted in.
+  websiteVerificationEnabled Boolean                     @default(false) @map("website_verification_enabled")
+  websiteVerificationApiKey  String?                     @unique @map("website_verification_api_key")
+  // Banner/Image Promotion and Video Promotion only: when true, tapping the
+  // task opens destinationUrl (Banner) / videoUrl (Video) in the external
+  // browser like most other campaign types. When false (the default), the
+  // banner image or video is instead shown full-screen inside an in-app
+  // modal for the same dwell duration, and the link is never opened - see
+  // campaign-detail.page.ts (Ionic) for the branch that reads this. Ignored
+  // for every other campaign type, the same way websiteVerificationEnabled
+  // above is ignored outside Website Promotion.
+  openLinkInBrowser          Boolean                     @default(false) @map("open_link_in_browser")
+  // YOUTUBE_SUBSCRIBE only: the target channel, copied at create/update time
+  // from the owning agent's OAuth-verified YouTubeConnection - never typed in
+  // by the agent (campaigns.service.ts's resolveYouTubeChannel). Snapshotted
+  // onto the campaign rather than read through the connection at verification
+  // time, so an agent disconnecting or switching Google accounts later can
+  // never silently repoint an already-running campaign at a different
+  // channel. youtubeChannelId is the only identifier verification ever
+  // matches on; the name/URL are for display and for opening the channel.
+  youtubeChannelId           String?                     @map("youtube_channel_id")
+  youtubeChannelName         String?                     @map("youtube_channel_name")
+  youtubeChannelUrl          String?                     @map("youtube_channel_url")
+  placement                  String?
+  // Higher priority wins when multiple internal campaigns target the same
+  // placement (spec Phase 13 §5) - purely a same-provider tiebreaker;
+  // provider-level priority (internal vs. mock/fallback) is decided in
+  // ads.service.ts, not stored here.
+  priority                   Int                         @default(0)
+  // Basic operational analytics (spec §24/§25): incremented once per feed-
+  // detail fetch, not per list-feed row, so the write cost stays bounded
+  // regardless of how many campaigns appear in a page of feed results.
+  viewCount                  Int                         @default(0) @map("view_count")
+  // "Click" analytics (spec Phase 8 §5/§6) - incremented at the exact moment
+  // the user's click-through intent is captured server-side: POST
+  // /tasks/:taskId/start, the same call that opens the external URL. Reusing
+  // that existing action rather than adding a separate "track click" endpoint
+  // a client could call arbitrarily many times without ever starting a task.
+  clickCount                 Int                         @default(0) @map("click_count")
+  createdAt                  DateTime                    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                  DateTime                    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  agent        AgentProfile         @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  subscription AgentSubscription?   @relation(fields: [subscriptionId], references: [id])
+  campaignType CampaignType         @relation(fields: [campaignTypeId], references: [id])
+  creatives    CampaignCreative[]
+  tasks        Task[]
+  completions  UserTaskCompletion[]
+  adEvents     AdEvent[]
+
+  @@index([agentId])
+  @@index([status])
+  @@index([subscriptionId])
+  @@index([expiresAt])
+  @@index([startsAt])
+  @@index([campaignTypeId])
+  @@index([placement, status])
+  @@map("campaigns")
+}
+
+enum CreativeType {
+  IMAGE
+  VIDEO
+}
+
+model CampaignCreative {
+  id         String       @id @default(uuid()) @db.Uuid
+  campaignId String       @map("campaign_id") @db.Uuid
+  type       CreativeType
+  url        String
+  metadata   Json         @default("{}")
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+  @@map("campaign_creatives")
+}
+
+// ---------------------------------------------------------------------------
+// Ad / Content delivery (Phase 13)
+// ---------------------------------------------------------------------------
+//
+// Provider-independent ad engine. Ionic never talks to a "campaign" or a
+// "mock provider" directly - it only ever calls
+// GET /ads/placements/:placement and gets back a normalized response
+// (see ads.service.ts). Today exactly two providers exist behind that
+// endpoint: the INTERNAL provider (queries the existing Campaign table by
+// `placement`/`priority`, added above - no new campaign table) and the
+// MOCK provider (a hardcoded fallback used only when no internal campaign
+// is eligible). GOOGLE/META rows in AdProviderConfig exist so the schema
+// and admin UI are ready for those providers later, but no such provider is
+// implemented (spec Phase 13 §14/§15/§16: "do not implement production
+// integrations unless explicitly requested").
+
+// Admin-managed placement registry (spec §7: "Admin should be able to
+// enable/disable placements"). A placement absent from this table, or
+// present but disabled, never returns internal-campaign content - the ad
+// engine falls through to the mock/fallback provider for it instead.
+model AdPlacement {
+  code        String   @id
+  name        String
+  description String?
+  isEnabled   Boolean  @default(true) @map("is_enabled")
+  updatedBy   String?  @map("updated_by") @db.Uuid
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("ad_placements")
+}
+
+enum AdProviderCode {
+  INTERNAL
+  MOCK
+  GOOGLE
+  META
+}
+
+// One row per provider (spec §13: "Provider enable/disable"). GOOGLE/META
+// rows exist for the admin toggle UI to be ready, but ads.service.ts never
+// routes to them today since no such provider is implemented.
+model AdProviderConfig {
+  provider  AdProviderCode @id
+  isEnabled Boolean        @default(true) @map("is_enabled")
+  // Non-secret display/config only (spec §3/§21: never store credentials
+  // here) - e.g. a future AdMob app ID is fine, a client secret is not.
+  config    Json           @default("{}")
+  updatedBy String?        @map("updated_by") @db.Uuid
+  updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("ad_provider_config")
+}
+
+enum AdEventType {
+  IMPRESSION
+  CLICK
+}
+
+// Internal-campaign ad analytics only (spec §10/§32) - never fires for
+// mock/fallback content, and never sends anything to Google/Meta. The
+// unique constraint on (trackingId, type) is the idempotency guard
+// (spec §10: "do not count the same event repeatedly because of frontend
+// re-rendering") - trackingId is minted fresh by ads.service.ts on every
+// GET /ads/placements/:placement response, so a re-render that replays the
+// same tracking call is a no-op, while a genuinely new ad delivery gets its
+// own trackingId and its own impression/click rows.
+model AdEvent {
+  id         String      @id @default(uuid()) @db.Uuid
+  campaignId String      @map("campaign_id") @db.Uuid
+  userId     String?     @map("user_id") @db.Uuid
+  placement  String
+  type       AdEventType
+  trackingId String      @map("tracking_id")
+  createdAt  DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  user     User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([trackingId, type])
+  @@index([campaignId])
+  @@index([userId, campaignId, createdAt])
+  @@map("ad_events")
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String?  @map("user_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id") @db.Uuid
+  metadata   Json     @default("{}")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Mobile OTP auth + wallet foundation (Phase 3)
+// ---------------------------------------------------------------------------
+
+// One row per OTP send; never updated in place except to record an attempt,
+// a verification, or a consumption - so a full history survives per phone.
+model OtpVerification {
+  id         String    @id @default(uuid()) @db.Uuid
+  phone      String
+  otpHash    String    @map("otp_hash")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  attempts   Int       @default(0)
+  verifiedAt DateTime? @map("verified_at") @db.Timestamptz(6)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([phone])
+  @@index([createdAt])
+  @@index([expiresAt])
+  @@map("otp_verifications")
+}
+
+model UserWallet {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @unique @map("user_id") @db.Uuid
+  // Rupees (INR), not a points/coin unit - the app's earning currency and
+  // the amount actually owed to the user. Decimal(12,2), never Float/Double,
+  // so money never accumulates binary-rounding drift. A DB-level
+  // `CHECK (balance >= 0)` constraint also exists on this column (spec
+  // Phase 11 §3) - Prisma's schema DSL has no declarative syntax for check
+  // constraints, so it's only visible in the
+  // 20260823200000_wallet_balance_check_constraint migration, not here.
+  balance   Decimal  @default(0) @map("balance") @db.Decimal(12, 2)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_wallets")
+}
+
+enum WalletTransactionType {
+  EARN
+  BONUS
+  ADJUSTMENT
+  // Debit posted only when a withdrawal reaches COMPLETED (spec Phase 7 §14)
+  // - never at request time, since a PENDING/PROCESSING withdrawal is only
+  // reserved against available balance (computed on read), not yet debited.
+  WITHDRAWAL
+}
+
+model WalletTransaction {
+  id            String                @id @default(uuid()) @db.Uuid
+  userId        String                @map("user_id") @db.Uuid
+  type          WalletTransactionType
+  amount        Decimal               @db.Decimal(12, 2)
+  referenceType String?               @map("reference_type")
+  referenceId   String?               @map("reference_id") @db.Uuid
+  description   String?
+  createdAt     DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Postgres treats each NULL as distinct, so this only bites when both
+  // fields are set (i.e. every reward-linked transaction) - a second reward
+  // credit for the same completion can never insert a second row, even
+  // under a race, without relying on application-level locking alone.
+  @@unique([referenceType, referenceId])
+  // Covers the actual query shape (spec Phase 10 DB review): every wallet-
+  // transaction list is `where userId, orderBy createdAt desc` - this one
+  // composite index serves both the filter and the sort, replacing what a
+  // plain `userId` index could only do the filter half of.
+  @@index([userId, createdAt])
+  @@map("wallet_transactions")
+}
+
+// ---------------------------------------------------------------------------
+// Game coin conversion (Master Direction phase)
+// ---------------------------------------------------------------------------
+//
+// The four standalone Ionic game apps are unauthenticated by design (spec
+// §1: "do not add registration/login/OTP to the four game apps"), so a game
+// has no persistent per-user coin ledger on this backend - coins are
+// tracked client-side inside the game app until the exact moment of
+// conversion. This backend is authoritative for the one thing it actually
+// can be: the conversion rate (admin-configured here, never hardcoded in
+// any client - spec §2/§17) and the resulting rupee amount, plus replay/
+// duplicate prevention via transactionReference. It cannot independently
+// verify an anonymous game session's true coin count - that would require
+// adding auth to the games, which spec §1 explicitly forbids.
+model Game {
+  id                  String   @id @default(uuid()) @db.Uuid
+  code                String   @unique // ROAD_RUSH / BRAIN_RUSH / MONSTER_ESCAPE / GAME_4 - exposed to API consumers as "gameCode"
+  name                String
+  isActive            Boolean  @default(true) @map("is_active")
+  // Phase 15A: separates "can this redemption happen at all" from "what does
+  // it pay out". A request below minimumCoins is rejected outright; a
+  // request at or above it converts the FULL submitted coin amount
+  // proportionally at coinsPerConversion:rupeesPerConversion (no leftover
+  // coins silently stranded, unlike the earlier whole-multiple-bucket
+  // design this replaces - see games.service.ts convertCoins()).
+  minimumCoins        Int      @default(1000) @map("minimum_coins")
+  coinsPerConversion  Int      @default(1000) @map("coins_per_conversion")
+  rupeesPerConversion Int      @default(10) @map("rupees_per_conversion")
+  updatedBy           String?  @map("updated_by") @db.Uuid
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  conversions GameCoinConversion[]
+
+  @@map("games")
+}
+
+enum GameConversionStatus {
+  COMPLETED
+  FAILED
+}
+
+// One row per successful coin->rupee conversion (spec §9: gameId/coins/
+// conversionRate/rupeeAmount/transactionId/timestamp/status, all stored).
+// The conversion rate is snapshotted onto the row at the moment of
+// conversion so a later admin rate change never rewrites conversion
+// history (same "stamp once, never retroactively recompute" precedent
+// CampaignType.rewardAmount already established for task rewards).
+model GameCoinConversion {
+  id                   String               @id @default(uuid()) @db.Uuid
+  gameId               String               @map("game_id") @db.Uuid
+  gameName             String               @map("game_name")
+  userId               String               @map("user_id") @db.Uuid
+  mobileNumber         String               @map("mobile_number")
+  coinsSubmitted       Int                  @map("coins_submitted")
+  coinsConverted       Int                  @map("coins_converted")
+  coinsPerConversion   Int                  @map("coins_per_conversion")
+  rupeesPerConversion  Int                  @map("rupees_per_conversion")
+  rupeeAmount          Decimal              @map("rupee_amount") @db.Decimal(12, 2)
+  // Client-generated idempotency key (spec §3: "Prevent duplicate
+  // conversion") - unique per game, so two different games can never
+  // collide on a coincidentally-identical reference from two unrelated
+  // clients.
+  transactionReference String               @map("transaction_reference")
+  status               GameConversionStatus @default(COMPLETED)
+  createdAt            DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  game Game @relation(fields: [gameId], references: [id])
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([gameId, transactionReference])
+  @@index([userId, createdAt])
+  @@map("game_coin_conversions")
+}
+
+// ---------------------------------------------------------------------------
+// Task / completion / reward engine (Phase 4)
+// ---------------------------------------------------------------------------
+
+// `type` and `configuration` are deliberately a free-form string + JSON blob
+// rather than an enum/rigid columns, so a new task type (e.g. a future
+// social-media action) needs a new config shape, not a migration or a code
+// path in the campaign engine itself (spec §4/§6).
+model Task {
+  id            String     @id @default(uuid()) @db.Uuid
+  campaignId    String     @map("campaign_id") @db.Uuid
+  title         String
+  description   String?
+  type          String
+  instructions  String?
+  // Source of truth for what a user earns completing this task - set by the
+  // agent at task-creation time, never computed or accepted from a client.
+  rewardAmount  Decimal    @map("reward_amount") @db.Decimal(12, 2)
+  sortOrder     Int        @default(0) @map("sort_order")
+  isRequired    Boolean    @default(true) @map("is_required")
+  status        TaskStatus @default(ACTIVE)
+  configuration Json       @default("{}")
+  createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  campaign    Campaign             @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  completions UserTaskCompletion[]
+
+  @@index([campaignId])
+  @@index([status])
+  @@map("tasks")
+}
+
+enum TaskStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum TaskCompletionStatus {
+  STARTED
+  SUBMITTED
+  PENDING
+  APPROVED
+  REJECTED
+  COMPLETED
+  EXPIRED
+}
+
+// The userId+taskId+cycleDate unique constraint is the hard backstop for "no
+// repeat reward within a cycle" (spec §10): a second /start for an
+// already-completed task in the same cycle can never insert a second row,
+// regardless of what the application layer does. cycleDate is a constant
+// "ONCE" sentinel for ordinary (non-repeating) campaigns, so this behaves
+// exactly like the old userId+taskId-only constraint for them.
+model UserTaskCompletion {
+  id                         String               @id @default(uuid()) @db.Uuid
+  userId                     String               @map("user_id") @db.Uuid
+  campaignId                 String               @map("campaign_id") @db.Uuid
+  taskId                     String               @map("task_id") @db.Uuid
+  // Groups completion rows into repeat cycles: a fixed "ONCE" sentinel for
+  // Campaign.completionFrequency = ONCE (so the unique constraint below still
+  // allows only one row per user+task, ever - unchanged from before this
+  // column existed), or the current UTC date ("YYYY-MM-DD") for DAILY
+  // campaigns, so a fresh row - and a fresh reward - is allowed each day.
+  cycleDate                  String               @default("ONCE") @map("cycle_date")
+  status                     TaskCompletionStatus @default(STARTED)
+  startedAt                  DateTime             @default(now()) @map("started_at") @db.Timestamptz(6)
+  submittedAt                DateTime?            @map("submitted_at") @db.Timestamptz(6)
+  completedAt                DateTime?            @map("completed_at") @db.Timestamptz(6)
+  // Snapshotted from Task.rewardAmount at the moment of crediting - stays
+  // fixed even if the agent later edits the task's reward (spec §12/TEST 7).
+  rewardAmount               Decimal?             @map("reward_amount") @db.Decimal(12, 2)
+  verificationStatus         String?              @map("verification_status")
+  verificationData           Json                 @default("{}") @map("verification_data")
+  rejectionReason            String?              @map("rejection_reason")
+  // Proof-upload + admin-review support for MANUAL-strategy tasks (social
+  // campaigns that require a screenshot rather than a self-confirmation
+  // click) - proofImageUrl is set via a dedicated upload endpoint before
+  // submit, reviewedBy/reviewedAt are stamped when an Admin approves or
+  // rejects a PENDING completion. Every other verification strategy leaves
+  // all three columns null and behaves exactly as before this addition.
+  proofImageUrl              String?              @map("proof_image_url")
+  reviewedBy                 String?              @map("reviewed_by") @db.Uuid
+  reviewedAt                 DateTime?            @map("reviewed_at") @db.Timestamptz(6)
+  // APP_DOWNLOAD-strategy tasks only (App Promotion): this device's OS
+  // Advertising ID (GAID/IDFA), captured at /start time and matched against
+  // the same ID the promoted app later reports to POST
+  // /app-verification/confirm - see app-verification.service.ts. Not unique:
+  // the same device can legitimately produce this ID across separate task
+  // attempts over time.
+  advertisingId              String?              @map("advertising_id")
+  // WEBSITE_TOKEN-strategy tasks only (Website Promotion with on-site
+  // verification): the one-time credential minted at /tasks/:id/start and
+  // handed to the promoted website as a URL parameter. The website posts it
+  // back to POST /website-verification/confirm, which is how a callback
+  // arriving from a browser with no Earnivo session at all is still traced
+  // to exactly this user, task and attempt - see
+  // website-verification.service.ts. Unique so a token can only ever
+  // resolve to one completion; kept (not cleared) after crediting so a
+  // retried callback is an idempotent no-op rather than an "unknown token"
+  // error.
+  verificationToken          String?              @unique @map("verification_token")
+  verificationTokenExpiresAt DateTime?            @map("verification_token_expires_at") @db.Timestamptz(6)
+  createdAt                  DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                  DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user                User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaign            Campaign                 @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  task                Task                     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  reviewedByUser      User?                    @relation("TaskCompletionReviewedBy", fields: [reviewedBy], references: [id])
+  youtubeVerification YouTubeTaskVerification?
+
+  @@unique([userId, taskId, cycleDate])
+  // Covers getMyCampaignHistory's `where userId[, status], orderBy
+  // createdAt desc` (spec Phase 10 DB review) - the unique(userId, taskId)
+  // above already indexes plain userId lookups, but not in createdAt order.
+  @@index([userId, createdAt])
+  @@index([campaignId])
+  @@index([status])
+  // Powers app-verification.service.ts's confirm lookup:
+  // { campaignId, advertisingId, status: 'STARTED' }.
+  @@index([advertisingId])
+  @@map("user_task_completions")
+}
+
+// ---------------------------------------------------------------------------
+// Payment / Withdrawal / Notification / Platform config (Phase 7)
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// Manual QR-based subscription payment proof (spec Phase 7 §8/§9/§10) - no
+// payment gateway. Approval never auto-activates anything by itself; the
+// admin service that flips this to APPROVED is the same one that calls the
+// existing admin-subscriptions.service.ts activateForAgent(), so there is
+// exactly one subscription-activation code path in the whole app.
+model Payment {
+  id                    String        @id @default(uuid()) @db.Uuid
+  agentId               String        @map("agent_id") @db.Uuid
+  planId                String        @map("plan_id") @db.Uuid
+  amount                Decimal       @db.Decimal(12, 2)
+  currency              String        @default("INR")
+  // Which cycle this payment is for (WEEKLY/MONTHLY/YEARLY - never FREE,
+  // submitPayment() only ever runs for a paid plan). `amount` above is
+  // computed server-side from plan.price/offerPercent x this cycle
+  // (plan-pricing.ts), never accepted from the client. Nullable only so
+  // this column doesn't need backfilling on rows submitted before this
+  // feature existed.
+  billingCycle          BillingCycle? @map("billing_cycle")
+  paymentMethod         String        @map("payment_method")
+  // Phase 12 future-gateway-ready fields - `provider` is 'MANUAL_QR' for
+  // every row today; a future PaymentProvider (Razorpay etc.) would write
+  // its own code here and populate providerTransactionId/metadata instead
+  // of transactionReference, without changing this table's shape or any
+  // subscription-activation logic.
+  provider              String        @default("MANUAL_QR")
+  providerTransactionId String?       @map("provider_transaction_id")
+  metadata              Json          @default("{}")
+  transactionReference  String        @map("transaction_reference")
+  paymentDate           DateTime      @map("payment_date") @db.Timestamptz(6)
+  proofImageUrl         String        @map("proof_image_url")
+  status                PaymentStatus @default(PENDING)
+  adminRemark           String?       @map("admin_remark")
+  verifiedBy            String?       @map("verified_by") @db.Uuid
+  verifiedAt            DateTime?     @map("verified_at") @db.Timestamptz(6)
+  createdAt             DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  agent          AgentProfile     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  plan           SubscriptionPlan @relation(fields: [planId], references: [id])
+  verifiedByUser User?            @relation("PaymentVerifiedBy", fields: [verifiedBy], references: [id])
+
+  // Duplicate-transaction-ID prevention (spec Phase 12 §7) needs a PARTIAL
+  // unique index (excluding REJECTED rows, since a rejected payment's
+  // reference must be resubmittable) - Prisma's schema DSL can't express a
+  // partial index, so it's hand-written in
+  // migrations/*_payment_duplicate_reference_guard/migration.sql only. This
+  // @@index is just the lookup index; it does not enforce uniqueness.
+  @@index([agentId])
+  @@index([status])
+  @@index([planId])
+  @@index([transactionReference])
+  @@map("payments")
+}
+
+enum WithdrawalMethod {
+  UPI
+  MOBILE
+}
+
+enum WithdrawalStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  REJECTED
+}
+
+// Available balance is computed on read as `wallet.balance - SUM(amount for
+// this user's PENDING/PROCESSING withdrawals)` rather than mutating the
+// wallet at request time (spec Phase 7 §14) - the wallet only ever changes
+// via a real WalletTransaction, posted exactly once, when a withdrawal
+// reaches COMPLETED. A REJECTED withdrawal therefore needs no "refund" step
+// at all: nothing was ever deducted from it.
+model Withdrawal {
+  id           String           @id @default(uuid()) @db.Uuid
+  userId       String           @map("user_id") @db.Uuid
+  amount       Decimal          @db.Decimal(12, 2)
+  method       WithdrawalMethod
+  upiId        String?          @map("upi_id")
+  mobileNumber String?          @map("mobile_number")
+  status       WithdrawalStatus @default(PENDING)
+  adminRemark  String?          @map("admin_remark")
+  processedBy  String?          @map("processed_by") @db.Uuid
+  processedAt  DateTime?        @map("processed_at") @db.Timestamptz(6)
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user            User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  processedByUser User? @relation("WithdrawalProcessedBy", fields: [processedBy], references: [id])
+
+  // [status] alone still serves the admin list (no userId filter there);
+  // [userId, createdAt] serves the user's own history (spec Phase 10 DB
+  // review).
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("withdrawals")
+}
+
+model Notification {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  type      String
+  title     String
+  message   String
+  metadata  Json     @default("{}")
+  isRead    Boolean  @default(false) @map("is_read")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, isRead])
+  // Replaces the old standalone createdAt index (spec Phase 10 DB review) -
+  // nothing queries notifications by date alone across all users; every
+  // real query is `where userId, orderBy createdAt desc`, which this
+  // composite actually serves.
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// One row per (device, signed-in user) - the FCM registration token this
+// backend pushes to. Kept separate from RefreshToken even though both are
+// per-device: a refresh token is a credential that must be revoked at
+// logout, while a push token stays valid on the device across sessions and
+// is simply re-pointed at whoever signs in next. Merging the two would mean
+// either losing the push token on every logout or keeping a revoked
+// credential alive just to hold it.
+model DeviceToken {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  // FCM's own registration token. Unique platform-wide rather than per
+  // user: a device handed to a second account must MOVE the token, not
+  // duplicate it, or the previous owner keeps receiving that device's
+  // notifications.
+  token      String   @unique
+  platform   String?
+  // The client's own deviceId (the same value RefreshToken stores), so a
+  // device whose FCM token rotates can have its stale row cleaned up on the
+  // next register instead of accumulating one dead token per rotation.
+  deviceId   String?  @map("device_id")
+  // Refreshed on every register call. FCM stops accepting tokens that have
+  // gone unused for ~270 days, so this is the column a future pruning job
+  // would sort on.
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, deviceId])
+  @@map("device_tokens")
+}
+
+// Single-row table (spec Phase 7 §11) - Admin Settings manages the payment
+// QR/UPI/receiver/instructions shown on the Agent payment screen, instead of
+// hardcoding them in Angular. No FK to User for updatedBy since it's purely
+// informational, matching CampaignType.updatedBy's existing precedent.
+model PlatformPaymentConfig {
+  id               String   @id @default(uuid()) @db.Uuid
+  qrImageUrl       String?  @map("qr_image_url")
+  upiId            String?  @map("upi_id")
+  receiverName     String?  @map("receiver_name")
+  instructions     String?
+  // Phase 12 additions - all optional/defaulted so the existing single row
+  // keeps working unchanged until an admin explicitly sets them.
+  isEnabled        Boolean  @default(true) @map("is_enabled")
+  minimumAmount    Decimal? @map("minimum_amount") @db.Decimal(12, 2)
+  supportedMethods String[] @map("supported_methods")
+  paymentNotes     String?  @map("payment_notes")
+  updatedBy        String?  @map("updated_by") @db.Uuid
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("platform_payment_config")
+}
+
+// ---------------------------------------------------------------------------
+// Referral (Phase 9)
+// ---------------------------------------------------------------------------
+
+// CLICKED is deliberately not a row-lifecycle state here - an anonymous
+// landing-page visit only increments User.referralClickCount (spec §12/§17:
+// "do not introduce invasive tracking unnecessarily"). A Referral row is
+// only ever created once a real account exists, at which point REGISTERED
+// and OTP_VERIFIED are the same atomic instant in this app's phone+OTP-only
+// signup (verifyOtpAndAuthenticate creates the User and marks phoneVerified
+// in one step - there is no separate "register now, verify OTP later" path
+// for the USER role) - so rows are created directly at OTP_VERIFIED rather
+// than manufacturing a REGISTERED-only row that would never be observably
+// different from it (spec §9: "only use the states actually required").
+enum ReferralStatus {
+  OTP_VERIFIED
+  QUALIFIED
+  REWARDED
+  REJECTED
+}
+
+// One row per referred user, never per click (spec §7: "store only the
+// minimum required attribution data"). referredUserId is unique - a given
+// account can be the *referred* party in at most one relationship, ever,
+// which is the hard backstop against the same signup generating a second
+// reward under any code (spec §12).
+model Referral {
+  id                       String         @id @default(uuid()) @db.Uuid
+  referrerId               String         @map("referrer_id") @db.Uuid
+  referredUserId           String         @unique @map("referred_user_id") @db.Uuid
+  // Snapshotted at creation - referrerId is the source of truth for the
+  // relationship; this is kept only for display/audit even if referral
+  // codes ever become regenerable later.
+  referralCode             String         @map("referral_code")
+  status                   ReferralStatus @default(OTP_VERIFIED)
+  // Referrer's reward - unchanged from before this field had a counterpart.
+  rewardAmount             Decimal?       @map("reward_amount") @db.Decimal(12, 2)
+  // New: the referred (joining) user's own bonus, mirroring rewardAmount's
+  // exact display/audit purpose for the other side of the same referral -
+  // so Admin can see both amounts on one row instead of joining out to
+  // WalletTransaction.
+  referredUserRewardAmount Decimal?       @map("referred_user_reward_amount") @db.Decimal(12, 2)
+  qualifiedAt              DateTime?      @map("qualified_at") @db.Timestamptz(6)
+  rewardedAt               DateTime?      @map("rewarded_at") @db.Timestamptz(6)
+  rejectionReason          String?        @map("rejection_reason")
+  // The referred (new) user's device at registration - fraud-detection
+  // signal only, never an auth identity (spec: "one physical device -> one
+  // rewarded referral"). Null for logins that predate this field or that
+  // never sent a deviceId. @unique is the DB-level backstop against the
+  // check-then-create race (two concurrent registrations on the same brand
+  // new device could otherwise both pass the app-level "already used?"
+  // check before either commits) - Postgres allows unlimited NULLs through
+  // a unique index, so untracked/legacy rows are unaffected; only two rows
+  // that both name the same real device ever collide.
+  deviceId                 String?        @unique @map("device_id")
+  createdAt                DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  referrer     User @relation("ReferralsMade", fields: [referrerId], references: [id], onDelete: Cascade)
+  referredUser User @relation("ReferralReceived", fields: [referredUserId], references: [id], onDelete: Cascade)
+
+  // [status] alone still serves the admin list/analytics (no referrerId
+  // filter there); [referrerId, createdAt] serves a user's own referral
+  // history (spec Phase 10 DB review).
+  @@index([referrerId, createdAt])
+  @@index([status])
+  @@map("referrals")
+}
+
+// Single-row table (spec §15) - same "one row is the whole config" pattern
+// as PlatformPaymentConfig. qualificationRule is a free-form string with
+// exactly one implemented value today ("OTP_VERIFIED", spec §8's stated
+// current minimum) - adding a future rule (e.g. "FIRST_TASK_COMPLETION")
+// means adding one more branch to referrals.service.ts's qualification
+// check, not a schema change (spec §8: "do not hardcode future rules unless
+// currently required").
+model ReferralConfig {
+  id                       String   @id @default(uuid()) @db.Uuid
+  // The referrer's reward, unchanged in meaning/name from before this field
+  // existed - kept as-is rather than renamed, since every existing call
+  // site already reads it as "the referrer's amount".
+  rewardAmount             Decimal  @default(0) @map("reward_amount") @db.Decimal(12, 2)
+  // New: the referred (joining) user's own bonus - a distinct amount from
+  // the referrer's reward, since "referral reward system" spec explicitly
+  // requires two different amounts, not one shared value split or
+  // duplicated. Defaults to 0 like rewardAmount always has, so a fresh
+  // environment never silently starts paying out money nobody configured.
+  referredUserRewardAmount Decimal  @default(0) @map("referred_user_reward_amount") @db.Decimal(12, 2)
+  currency                 String   @default("INR")
+  qualificationRule        String   @default("OTP_VERIFIED") @map("qualification_rule")
+  isActive                 Boolean  @default(true) @map("is_active")
+  updatedBy                String?  @map("updated_by") @db.Uuid
+  updatedAt                DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("referral_config")
+}
+
+// ---------------------------------------------------------------------------
+// CMS / Support (Phase 11)
+// ---------------------------------------------------------------------------
+
+// One row per static content page (spec §4/§7/§8) - a single reusable shape
+// for About/Terms/Privacy rather than three near-identical tables, matching
+// the "reusable CMS structures" instruction. FAQ and Contact are
+// deliberately separate models below since their actual shape (a list of
+// Q&A items; a handful of structured contact fields) doesn't fit this
+// single-long-document shape at all.
+enum CmsPageType {
+  ABOUT
+  TERMS
+  PRIVACY
+}
+
+model CmsPage {
+  id          String      @id @default(uuid()) @db.Uuid
+  type        CmsPageType @unique
+  title       String
+  content     String
+  version     String      @default("1.0")
+  isPublished Boolean     @default(true) @map("is_published")
+  publishedAt DateTime?   @map("published_at") @db.Timestamptz(6)
+  updatedBy   String?     @map("updated_by") @db.Uuid
+  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("cms_pages")
+}
+
+model Faq {
+  id           String   @id @default(uuid()) @db.Uuid
+  question     String
+  answer       String
+  category     String?
+  isPublished  Boolean  @default(true) @map("is_published")
+  displayOrder Int      @default(0) @map("display_order")
+  updatedBy    String?  @map("updated_by") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  // Ionic only ever fetches the published set ordered for display (spec
+  // §6: "fetch published FAQs only") - this composite serves exactly that
+  // query.
+  @@index([isPublished, displayOrder])
+  @@map("faqs")
+}
+
+// Single-row table (spec §5) - same pattern as PlatformPaymentConfig/
+// ReferralConfig.
+model ContactConfig {
+  id            String   @id @default(uuid()) @db.Uuid
+  email         String?
+  phone         String?
+  whatsapp      String?
+  address       String?
+  businessHours String?  @map("business_hours")
+  description   String?
+  facebookUrl   String?  @map("facebook_url")
+  instagramUrl  String?  @map("instagram_url")
+  twitterUrl    String?  @map("twitter_url")
+  updatedBy     String?  @map("updated_by") @db.Uuid
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("contact_config")
+}
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+// One ticket model for every role (spec §9's flow works identically whether
+// the reporter is a USER or an AGENT - both are User rows already) rather
+// than separate user/agent support tables.
+model SupportTicket {
+  id         String              @id @default(uuid()) @db.Uuid
+  userId     String              @map("user_id") @db.Uuid
+  category   String
+  subject    String
+  message    String
+  status     SupportTicketStatus @default(OPEN)
+  adminReply String?             @map("admin_reply")
+  assignedTo String?             @map("assigned_to") @db.Uuid
+  createdAt  DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+  resolvedAt DateTime?           @map("resolved_at") @db.Timestamptz(6)
+
+  user     User  @relation("SupportTicketsRaised", fields: [userId], references: [id], onDelete: Cascade)
+  assignee User? @relation("SupportTicketsAssigned", fields: [assignedTo], references: [id])
+
+  @@index([userId])
+  @@index([status])
+  @@map("support_tickets")
+}
+
+// ---------------------------------------------------------------------------
+// Google OAuth / YouTube subscription verification
+// ---------------------------------------------------------------------------
+//
+// Two different jobs, deliberately kept in two tables. A
+// GoogleAccountConnection is "this Earnivo account has authorized us to call
+// Google as them" - it exists for both roles and holds nothing but identity
+// and (encrypted) credentials. A YouTubeConnection is the AGENT-only
+// consequence of that: the specific channel their authorized Google account
+// owns, resolved once through the YouTube Data API and then treated as the
+// verified identity of that agent's channel.
+//
+// The verification itself never mixes the two: a user's own OAuth grant
+// answers "is this person subscribed to channel X", and the agent's grant is
+// only ever what proved channel X belongs to that agent in the first place
+// (see youtube-verification.service.ts). The agent's token is never used to
+// read their subscriber list.
+
+enum GoogleConnectionOwnerType {
+  USER
+  AGENT
+}
+
+enum GoogleConnectionStatus {
+  CONNECTED
+  // Google still knows about us but we can no longer act: the refresh token
+  // was revoked (owner removed access from their Google account settings),
+  // expired, or was rejected. This is the "reconnect your Google account"
+  // state - distinct from DISCONNECTED, which is the owner's own choice.
+  REAUTH_REQUIRED
+  DISCONNECTED
+}
+
+// One row per connected account, keyed by whichever owner column applies -
+// both are nullable and both are unique, which in Postgres means "at most
+// one connection per user, at most one per agent" while leaving the other
+// column NULL on every row (NULLs never collide in a unique index).
+model GoogleAccountConnection {
+  id                    String                    @id @default(uuid()) @db.Uuid
+  ownerType             GoogleConnectionOwnerType @map("owner_type")
+  userId                String?                   @unique @map("user_id") @db.Uuid
+  agentId               String?                   @unique @map("agent_id") @db.Uuid
+  // Google's stable `sub` claim - the same identifier User.googleId already
+  // trusts for sign-in. Not unique here: the same Google account may
+  // legitimately be connected by a user for verification and by an agent for
+  // their channel, and re-connecting simply overwrites the owner's own row.
+  googleAccountId       String                    @map("google_account_id")
+  email                 String?
+  // AES-256-GCM ciphertext (utils/crypto.ts), never the raw token. Neither
+  // column is ever selected into an API response - see the serializers in
+  // google-oauth.service.ts, which whitelist fields explicitly.
+  accessTokenEncrypted  String?                   @map("access_token_encrypted")
+  refreshTokenEncrypted String?                   @map("refresh_token_encrypted")
+  tokenExpiry           DateTime?                 @map("token_expiry") @db.Timestamptz(6)
+  // Exactly what Google granted, which is not necessarily what was asked
+  // for - a person can untick a scope on the consent screen, and the only
+  // way to fail with a useful message instead of a confusing 403 from the
+  // YouTube API later is to check this at connect time.
+  scopes                String[]
+  status                GoogleConnectionStatus    @default(CONNECTED)
+  lastRefreshedAt       DateTime?                 @map("last_refreshed_at") @db.Timestamptz(6)
+  createdAt             DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime                  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user              User?              @relation("UserGoogleConnection", fields: [userId], references: [id], onDelete: Cascade)
+  agent             AgentProfile?      @relation("AgentGoogleConnection", fields: [agentId], references: [id], onDelete: Cascade)
+  youtubeConnection YouTubeConnection?
+
+  @@index([googleAccountId])
+  @@map("google_account_connections")
+}
+
+// The agent's OAuth-verified channel. Created only from a live YouTube Data
+// API channels?mine=true call against the agent's own grant, so the channel
+// id here is proof of ownership rather than something an agent typed - which
+// is the whole reason a YOUTUBE_SUBSCRIBE campaign can trust it as its
+// target (campaigns.service.ts).
+model YouTubeConnection {
+  id                 String   @id @default(uuid()) @db.Uuid
+  agentId            String   @unique @map("agent_id") @db.Uuid
+  googleConnectionId String   @unique @map("google_connection_id") @db.Uuid
+  youtubeChannelId   String   @map("youtube_channel_id")
+  youtubeChannelName String   @map("youtube_channel_name")
+  thumbnailUrl       String?  @map("thumbnail_url")
+  channelUrl         String?  @map("channel_url")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  agent            AgentProfile            @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  googleConnection GoogleAccountConnection @relation(fields: [googleConnectionId], references: [id], onDelete: Cascade)
+
+  @@index([youtubeChannelId])
+  @@map("youtube_connections")
+}
+
+enum YouTubeVerificationStatus {
+  WAITING_FOR_VERIFICATION
+  VERIFIED
+}
+
+// The audit trail for one user's attempt at one YOUTUBE_SUBSCRIBE task:
+// which channel was checked, how many times, what went wrong last time, and
+// when it finally passed. Deliberately NOT the state machine - the
+// UserTaskCompletion row remains the single source of truth for whether a
+// task is credited (its unique userId+taskId+cycleDate constraint and
+// reward.service.ts's guarded update are what actually prevent a double
+// reward). This table exists so a "why did my reward not arrive" support
+// question has an answer, without duplicating completion state.
+//
+// userId/campaignId/taskId are plain columns rather than relations: the
+// completion this row hangs off already cascades from all three, so adding
+// three more foreign keys would buy nothing but write cost.
+model YouTubeTaskVerification {
+  id                        String                    @id @default(uuid()) @db.Uuid
+  completionId              String                    @unique @map("completion_id") @db.Uuid
+  userId                    String                    @map("user_id") @db.Uuid
+  campaignId                String                    @map("campaign_id") @db.Uuid
+  taskId                    String                    @map("task_id") @db.Uuid
+  // Snapshotted from the campaign at /start, so the answer to "which channel
+  // was this attempt actually checked against" survives any later edit.
+  youtubeChannelId          String                    @map("youtube_channel_id")
+  status                    YouTubeVerificationStatus @default(WAITING_FOR_VERIFICATION)
+  verificationMethod        String                    @default("YOUTUBE_OAUTH") @map("verification_method")
+  attemptCount              Int                       @default(0) @map("attempt_count")
+  // A short, already-user-safe reason string ("subscription not found",
+  // "reconnect required") - never an API payload and never a token.
+  lastFailureReason         String?                   @map("last_failure_reason")
+  verifiedAt                DateTime?                 @map("verified_at") @db.Timestamptz(6)
+  lastVerificationAttemptAt DateTime?                 @map("last_verification_attempt_at") @db.Timestamptz(6)
+  createdAt                 DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                 DateTime                  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  completion UserTaskCompletion @relation(fields: [completionId], references: [id], onDelete: Cascade)
+
+  @@index([userId, campaignId])
+  @@index([status])
+  @@map("youtube_task_verifications")
+}
