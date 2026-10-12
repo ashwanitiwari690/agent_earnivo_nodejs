@@ -83,7 +83,7 @@ const SUBSCRIPTION_PLANS = [
 ];
 
 const AD_PLACEMENTS = [
-  { code: 'HOME_BANNER', name: 'Home Banner', description: 'Top banner on the Home tab.' },
+  // { code: 'HOME_BANNER', name: 'Home Banner', description: 'Top banner on the Home tab.' },
   { code: 'HOME_CARD', name: 'Home Card', description: 'Promotional card in the Home tab feed.' },
   { code: 'TASK_BANNER', name: 'Task Banner', description: 'Banner above the task/campaign feed.' },
   { code: 'TASK_BOTTOM', name: 'Task Bottom', description: 'Slot below a task/campaign detail.' },

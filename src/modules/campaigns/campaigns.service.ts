@@ -190,7 +190,7 @@ export async function createDraft(agentId: string, input: CreateCampaignInput, u
       destinationUrl: input.destinationUrl,
       cta: input.cta,
       completionLimit: input.completionLimit,
-      completionFrequency: input.completionFrequency ?? 'ONCE',
+      completionFrequency: campaignType.code === 'APP_PROMOTION' ? 'ONCE' : (input.completionFrequency ?? 'ONCE'),
       openLinkInBrowser,
       // Spread last so it overrides any destinationUrl the client sent: for
       // this type the channel is the destination, and an agent-supplied URL
@@ -470,7 +470,7 @@ export async function updateDraft(agentId: string, campaignId: string, input: Pa
       destinationUrl: input.destinationUrl,
       cta: input.cta,
       completionLimit: input.completionLimit,
-      completionFrequency: input.completionFrequency,
+      completionFrequency: campaign.campaignType.code === 'APP_PROMOTION' ? 'ONCE' : (input.completionFrequency ?? campaign.completionFrequency),
       // Same reasoning as createDraft: spread after destinationUrl so the
       // verified channel always wins over anything the client sent.
       ...(youtube ?? {}),

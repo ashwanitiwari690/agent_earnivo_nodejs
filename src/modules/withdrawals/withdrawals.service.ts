@@ -8,7 +8,7 @@ import { writeAuditLog } from '../audit/audit.service.js';
 // Candidate for a future PlatformSetting row if this ever needs to be
 // admin-configurable without a deploy; kept as a backend constant for now
 // rather than hardcoding it in Angular/Ionic (spec Phase 7 §13).
-const MIN_WITHDRAWAL_AMOUNT = 100;
+const MIN_WITHDRAWAL_AMOUNT = 50;
 
 function serializeWithdrawal(w: any) {
   return { ...w, amount: toMoneyString(w.amount) };
